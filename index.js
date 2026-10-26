@@ -1,20 +1,71 @@
 require("dotenv").config();
-const { WakaTimeClient, RANGE } = require("wakatime-client");
 const { Octokit } = require("@octokit/rest");
 
 const {
   GIST_ID: gistId,
   GH_TOKEN: githubToken,
-  WAKATIME_API_KEY: wakatimeApiKey
+  WAKATIME_ACCESS_TOKEN: wakatimeAccessToken
 } = process.env;
 
-const wakatime = new WakaTimeClient(wakatimeApiKey);
-
-const octokit = new Octokit({ auth: `token ${githubToken}` });
-
 async function main() {
-  const stats = await wakatime.getMyStats({ range: RANGE.LAST_7_DAYS });
-  await updateGist(stats);
+  const missing = ["GIST_ID", "GH_TOKEN", "WAKATIME_ACCESS_TOKEN"].filter(
+    name => !process.env[name] || !process.env[name].trim()
+  );
+  if (missing.length) {
+    console.error(
+      `Missing required environment variables: ${missing.join(", ")}`
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  let operation = "read WakaTime stats";
+  try {
+    const response = await fetch(
+      "https://api.wakatime.com/api/v1/users/current/stats/last_7_days",
+      {
+        headers: { Authorization: `Bearer ${wakatimeAccessToken}` },
+        redirect: "error",
+        signal: AbortSignal.timeout(30000)
+      }
+    );
+    if (response.status !== 200) {
+      throw Object.assign(new Error(), { response });
+    }
+    const stats = await response.json();
+    if (
+      !stats ||
+      !stats.data ||
+      stats.data.is_up_to_date === false ||
+      !Array.isArray(stats.data.languages) ||
+      !stats.data.languages.every(
+        language =>
+          language &&
+          typeof language.name === "string" &&
+          typeof language.text === "string" &&
+          Number.isFinite(language.percent) &&
+          language.percent >= 0 &&
+          language.percent <= 100
+      )
+    ) {
+      throw new Error();
+    }
+    if (stats.data.languages.length === 0) return;
+
+    operation = "get gist";
+    const octokit = new Octokit({ auth: githubToken });
+    const gist = await octokit.gists.get({ gist_id: gistId });
+    operation = "update gist";
+    await updateGist(stats, gist, octokit);
+  } catch (error) {
+    // Request errors can contain credentials in headers; log only the stage/status.
+    const status =
+      error.response && Number.isInteger(error.response.status)
+        ? ` (HTTP ${error.response.status})`
+        : "";
+    console.error(`Unable to ${operation}${status}.`);
+    process.exitCode = 1;
+  }
 }
 
 function trimRightStr(str, len) {
@@ -22,14 +73,7 @@ function trimRightStr(str, len) {
   return str.length > len ? str.substring(0, len - 3) + "..." : str;
 }
 
-async function updateGist(stats) {
-  let gist;
-  try {
-    gist = await octokit.gists.get({ gist_id: gistId });
-  } catch (error) {
-    console.error(`Unable to get gist\n${error}`);
-  }
-
+async function updateGist(stats, gist, octokit) {
   const lines = [];
   for (let i = 0; i < Math.min(stats.data.languages.length, 5); i++) {
     const data = stats.data.languages[i];
@@ -45,23 +89,18 @@ async function updateGist(stats) {
     lines.push(line.join(" "));
   }
 
-  if (lines.length == 0) return;
-
-  try {
-    // Get original filename to update that same file
-    const filename = Object.keys(gist.data.files)[0];
-    await octokit.gists.update({
-      gist_id: gistId,
-      files: {
-        [filename]: {
-          filename: `📊 Weekly development breakdown`,
-          content: lines.join("\n")
-        }
+  // Get original filename to update that same file
+  const filename = Object.keys(gist.data.files)[0];
+  if (!filename) throw new Error();
+  await octokit.gists.update({
+    gist_id: gistId,
+    files: {
+      [filename]: {
+        filename: `📊 Weekly development breakdown`,
+        content: lines.join("\n")
       }
-    });
-  } catch (error) {
-    console.error(`Unable to update gist\n${error}`);
-  }
+    }
+  });
 }
 
 function generateBarChart(percent, size) {
@@ -79,6 +118,4 @@ function generateBarChart(percent, size) {
     .padEnd(size, syms.substring(0, 1));
 }
 
-(async () => {
-  await main();
-})();
+main();
